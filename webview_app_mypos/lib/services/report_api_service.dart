@@ -61,7 +61,7 @@ class ReportApiService {
   }
 
   /// Initialize device info cache at app start for faster submissions.
-  Future<void> init() async {
+  Future<void> initialize() async {
     debugPrint('$_tag 🚀 Initializing ReportApiService...');
     await _loadDeviceInfo();
     debugPrint('$_tag ✅ Initialized | device_id=$_cachedDeviceId | device_name=$_cachedDeviceName | app_version=$_cachedAppVersion');
@@ -83,6 +83,9 @@ class ReportApiService {
 
       final packageInfo = await PackageInfo.fromPlatform();
       _cachedAppVersion = packageInfo.version;
+      debugPrint(
+        '$_tag ✅ Initialized | device_id=$_cachedDeviceId | device_name=$_cachedDeviceName | app_version=$_cachedAppVersion',
+      );
     } catch (e) {
       debugPrint('$_tag ❌ Error loading device info: $e');
     }
@@ -97,6 +100,47 @@ class ReportApiService {
   /// [scanResult] – 'success', 'fail', or 'invalid' (invalid only for ticket)
   ///
   /// Uses retry logic with exponential backoff.
+  /// Logs app start event to Sentry with device details.
+  Future<void> logAppStart() async {
+    try {
+      // Ensure device info is loaded
+      if (_cachedDeviceName == null || _cachedAppVersion == null) {
+        await _loadDeviceInfo();
+      }
+
+      final deviceName = _cachedDeviceName ?? 'Unknown Device';
+      final appVersion = _cachedAppVersion ?? 'Unknown Version';
+
+      debugPrint('$_tag 📱 Logging App Start: $deviceName (v$appVersion)');
+
+      // Send start log and wait for it to complete or timeout
+      Sentry.captureMessage(
+        '📱 App Started on Device: $deviceName',
+        level: SentryLevel.info,
+        withScope: (scope) {
+          scope.setTag('device_name', deviceName);
+          scope.setTag('app_version', appVersion);
+          if (_cachedDeviceId != null) {
+            scope.setTag('device_id', _cachedDeviceId!);
+          }
+        },
+      ).timeout(
+        const Duration(seconds: 5),
+        onTimeout: () {
+          debugPrint('$_tag ⚠️ Sentry log app start timed out');
+          return SentryId.empty();
+        },
+      );
+
+      debugPrint('$_tag ✅ App Start logged to Sentry');
+    } catch (e, stackTrace) {
+      debugPrint('$_tag ❌ Error logging app start: $e');
+      try {
+        Sentry.captureException(e, stackTrace: stackTrace);
+      } catch (_) {}
+    }
+  }
+
   Future<bool> submitReport({
     required String scanType,
     required String scanResult,
@@ -126,14 +170,16 @@ class ReportApiService {
         'app_version': _cachedAppVersion ?? '1.0.0',
         'burgenland_success':
             (scanType == 'burgenland' && scanResult == 'success') ? 1 : 0,
-        'burgenland_fail':
-            (scanType == 'burgenland' && scanResult == 'fail') ? 1 : 0,
-        'ticket_success':
-            (scanType == 'ticket' && scanResult == 'success') ? 1 : 0,
-        'ticket_invalid':
-            (scanType == 'ticket' && scanResult == 'invalid') ? 1 : 0,
-        'ticket_fail':
-            (scanType == 'ticket' && scanResult == 'fail') ? 1 : 0,
+        'burgenland_fail': (scanType == 'burgenland' && scanResult == 'fail')
+            ? 1
+            : 0,
+        'ticket_success': (scanType == 'ticket' && scanResult == 'success')
+            ? 1
+            : 0,
+        'ticket_invalid': (scanType == 'ticket' && scanResult == 'invalid')
+            ? 1
+            : 0,
+        'ticket_fail': (scanType == 'ticket' && scanResult == 'fail') ? 1 : 0,
       };
 
       debugPrint('$_tag #$callId 📦 Payload: $payload');
@@ -144,16 +190,17 @@ class ReportApiService {
         try {
           debugPrint('$_tag #$callId 🔄 Attempt $attempt/$_maxRetries...');
 
-          final response = await _dio.post(
-            _submitReportPath,
-            data: payload,
-          );
+          final response = await _dio.post(_submitReportPath, data: payload);
 
-          debugPrint('$_tag #$callId 📥 Response status: ${response.statusCode}');
+          debugPrint(
+            '$_tag #$callId 📥 Response status: ${response.statusCode}',
+          );
           debugPrint('$_tag #$callId 📥 Response body: ${response.data}');
 
           if (response.statusCode == 200 || response.statusCode == 201) {
-            debugPrint('$_tag #$callId ✅ SUCCESS - Report submitted (attempt $attempt)');
+            debugPrint(
+              '$_tag #$callId ✅ SUCCESS - Report submitted (attempt $attempt)',
+            );
             debugPrint('══════════════════════════════════════════════');
             debugPrint('');
             return true;
@@ -176,7 +223,9 @@ class ReportApiService {
             debugPrint('$_tag #$callId ⏳ Retrying in ${delay.inSeconds}s...');
             await Future.delayed(delay);
           } else {
-            debugPrint('$_tag #$callId 💀 ALL RETRIES EXHAUSTED - Logging to Sentry');
+            debugPrint(
+              '$_tag #$callId 💀 ALL RETRIES EXHAUSTED - Logging to Sentry',
+            );
             // Final attempt failed – log to Sentry
             try {
               Sentry.captureException(
